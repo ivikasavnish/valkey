@@ -54,7 +54,7 @@
 
 #include "eval.h"
 #include "router/entrypoint.h"
-#include "executor/worker.h"
+#include "executor/coroutine.h"
 
 #include "trace/trace_commands.h"
 
@@ -1919,9 +1919,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     processIOThreadsWriteDone();
 
-    /* v3: Process accelerator completion queue */
+    /* v4: Run ready coroutines (process up to 100 per event loop iteration) */
 #ifdef ENABLE_ACCELERATOR
-    worker_process_completions();
+    coroutine_run_ready(100);
 #endif
 
     /* Record cron time in beforeSleep. This does not include the time consumed by AOF writing and IO writing above. */

@@ -29,7 +29,7 @@
  */
 
 #include "entrypoint.h"
-#include "../executor/worker.h"
+#include "../executor/coroutine.h"
 #include <string.h>
 
 /* Metrics counters */
@@ -39,24 +39,26 @@ long long fallback_invocations = 0;
 
 #ifdef ENABLE_ACCELERATOR
 
-/* Command configuration: name and worker pool */
+/* Command configuration: name, coroutine pool, and write flag */
 typedef struct {
     const char *name;
-    worker_pool_type pool;
+    coro_pool_type_t pool;
+    int is_write;
 } command_config;
 
-/* Whitelist of accelerated commands with their worker pools */
+/* Whitelist of accelerated commands with their coroutine pools */
 static const command_config accelerated_commands[] = {
-    {"get", WORKER_POOL_STRING},
-    {"set", WORKER_POOL_STRING},
-    {"incr", WORKER_POOL_STRING},
-    {"hget", WORKER_POOL_HASH},
-    {"hset", WORKER_POOL_HASH},
-    {NULL, 0}
+    {"get", CORO_POOL_STRING, 0},     /* Read operation */
+    {"set", CORO_POOL_STRING, 1},     /* Write operation */
+    {"incr", CORO_POOL_STRING, 1},    /* Write operation */
+    {"hget", CORO_POOL_HASH, 0},      /* Read operation */
+    {"hset", CORO_POOL_HASH, 1},      /* Write operation */
+    {NULL, 0, 0}
 };
 
 /* Check if a command is in the acceleration whitelist and return its pool */
-static int get_accelerated_command_pool(const struct serverCommand *cmd, worker_pool_type *pool) {
+static int get_accelerated_command_pool(const struct serverCommand *cmd, 
+                                        coro_pool_type_t *pool, int *is_write) {
     if (!cmd || !cmd->declared_name) {
         return 0;
     }
@@ -64,6 +66,7 @@ static int get_accelerated_command_pool(const struct serverCommand *cmd, worker_
     for (int i = 0; accelerated_commands[i].name != NULL; i++) {
         if (strcasecmp(cmd->declared_name, accelerated_commands[i].name) == 0) {
             *pool = accelerated_commands[i].pool;
+            *is_write = accelerated_commands[i].is_write;
             return 1;
         }
     }
@@ -73,14 +76,16 @@ static int get_accelerated_command_pool(const struct serverCommand *cmd, worker_
 
 /* Check if a command is in the acceleration whitelist */
 int is_accelerated_command(const struct serverCommand *cmd) {
-    worker_pool_type pool;
-    return get_accelerated_command_pool(cmd, &pool);
+    coro_pool_type_t pool;
+    int is_write;
+    return get_accelerated_command_pool(cmd, &pool, &is_write);
 }
 
 /* Route command through accelerated execution path
  * 
- * v3: True async execution with completion queue pattern.
- * Workers execute commands in parallel, results processed by main thread.
+ * v4: Coroutine-based execution integrating with epoll event loop.
+ * Lightweight coroutines execute commands cooperatively, yielding when necessary.
+ * Much lower overhead than threads, better integration with event loop.
  */
 void command_entrypoint(client *c) {
     /* Safety checks - if anything looks wrong, fallback immediately */
@@ -92,38 +97,52 @@ void command_entrypoint(client *c) {
         return;
     }
     
-    /* Determine which worker pool to use */
-    worker_pool_type pool;
-    if (!get_accelerated_command_pool(c->cmd, &pool)) {
+    /* Determine which coroutine pool to use */
+    coro_pool_type_t pool;
+    int is_write;
+    if (!get_accelerated_command_pool(c->cmd, &pool, &is_write)) {
         /* Not in whitelist - fallback */
         fallback_invocations++;
         call(c, CMD_CALL_FULL);
         return;
     }
     
-    /* v3: Enqueue to worker pool for async execution */
-    int result = worker_enqueue_command(c, pool);
+    /* Extract key from command */
+    sds key = NULL;
+    if (c->argc >= 2 && c->argv[1]) {
+        key = objectGetVal(c->argv[1]);
+    }
     
-    if (result != 0) {
-        /* Failed to enqueue - fallback to legacy path */
+    if (!key) {
+        /* No key - fallback */
+        fallback_invocations++;
+        call(c, CMD_CALL_FULL);
+        return;
+    }
+    
+    /* v4: Schedule command in coroutine */
+    int result = coroutine_schedule(c, key, is_write, pool);
+    
+    if (result == 0) {
+        /* Failed to schedule - coroutine pool full, fallback to legacy path */
         fallback_invocations++;
         call(c, CMD_CALL_FULL);
     } else {
         accelerated_commands_total++;
-        /* Command will be executed by worker, response sent via completion queue */
+        /* Command will be executed by coroutine when scheduled */
     }
 }
 
 /* Initialize the accelerator system */
 void accelerator_init(void) {
-    /* Initialize worker infrastructure with completion queue (v3) */
-    worker_init();
-    serverLog(LL_NOTICE, "Accelerator v3 enabled (async execution + completion queue)");
+    /* Initialize coroutine system (v4) */
+    coroutine_init();
+    serverLog(LL_NOTICE, "Accelerator v4 enabled (coroutine-based execution)");
 }
 
 /* Shutdown the accelerator system */
 void accelerator_shutdown(void) {
-    worker_shutdown();
+    coroutine_shutdown();
     serverLog(LL_NOTICE, "Accelerator shutdown complete");
 }
 
