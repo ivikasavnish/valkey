@@ -53,6 +53,7 @@
 #include "util.h"
 
 #include "eval.h"
+#include "router/entrypoint.h"
 
 #include "trace/trace_commands.h"
 
@@ -3123,6 +3124,7 @@ void InitServerLast(void) {
     initIOThreads();
     set_jemalloc_bg_thread(server.jemalloc_bg_thread);
     server.initial_memory_usage = zmalloc_used_memory();
+    accelerator_init();
 }
 
 /* The purpose of this function is to try to "glue" consecutive range
@@ -4485,8 +4487,14 @@ int processCommand(client *c) {
         queueMultiCommand(c, cmd_flags);
         addReply(c, shared.queued);
     } else {
-        int flags = CMD_CALL_FULL;
-        call(c, flags);
+        /* Check if this command should use the accelerated path */
+        if (is_accelerated_command(c->cmd)) {
+            command_entrypoint(c);
+        } else {
+            int flags = CMD_CALL_FULL;
+            call(c, flags);
+            legacy_commands_total++;
+        }
         if (listLength(server.ready_keys) && !isInsideYieldingLongCommand()) handleClientsBlockedOnKeys();
     }
     return C_OK;
@@ -4788,6 +4796,8 @@ int finishShutdown(void) {
 
     /* Close the listening sockets. Apparently this allows faster restarts. */
     closeListeningSockets(1);
+
+    accelerator_shutdown();
 
     moduleUnloadAllModules();
 
