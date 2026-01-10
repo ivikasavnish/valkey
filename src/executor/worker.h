@@ -46,8 +46,11 @@ void worker_init(void);
 /* Shutdown worker threads */
 void worker_shutdown(void);
 
-/* Enqueue a command for execution */
+/* Enqueue a command for async execution */
 int worker_enqueue_command(client *c, worker_pool_type pool);
+
+/* Process completed commands from workers (called from main thread) */
+void worker_process_completions(void);
 
 /* Acquire key lock for write operations */
 int key_lock_acquire(sds key, int write_lock);
