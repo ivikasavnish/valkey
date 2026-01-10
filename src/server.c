@@ -53,6 +53,8 @@
 #include "util.h"
 
 #include "eval.h"
+#include "router/entrypoint.h"
+#include "executor/coroutine.h"
 
 #include "trace/trace_commands.h"
 
@@ -1917,6 +1919,11 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     processIOThreadsWriteDone();
 
+    /* v4: Run ready coroutines (process up to 100 per event loop iteration) */
+#ifdef ENABLE_ACCELERATOR
+    coroutine_run_ready(100);
+#endif
+
     /* Record cron time in beforeSleep. This does not include the time consumed by AOF writing and IO writing above. */
     monotime cron_start_time_after_write = getMonotonicUs();
 
@@ -3123,6 +3130,7 @@ void InitServerLast(void) {
     initIOThreads();
     set_jemalloc_bg_thread(server.jemalloc_bg_thread);
     server.initial_memory_usage = zmalloc_used_memory();
+    accelerator_init();
 }
 
 /* The purpose of this function is to try to "glue" consecutive range
@@ -4485,8 +4493,14 @@ int processCommand(client *c) {
         queueMultiCommand(c, cmd_flags);
         addReply(c, shared.queued);
     } else {
-        int flags = CMD_CALL_FULL;
-        call(c, flags);
+        /* Check if this command should use the accelerated path */
+        if (is_accelerated_command(c->cmd)) {
+            command_entrypoint(c);
+        } else {
+            int flags = CMD_CALL_FULL;
+            call(c, flags);
+            legacy_commands_total++;
+        }
         if (listLength(server.ready_keys) && !isInsideYieldingLongCommand()) handleClientsBlockedOnKeys();
     }
     return C_OK;
@@ -4788,6 +4802,8 @@ int finishShutdown(void) {
 
     /* Close the listening sockets. Apparently this allows faster restarts. */
     closeListeningSockets(1);
+
+    accelerator_shutdown();
 
     moduleUnloadAllModules();
 
@@ -6238,6 +6254,18 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "eventloop_duration_cmd_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_CMD].sum,
                 "instantaneous_eventloop_cycles_per_sec:%llu\r\n", getInstantaneousMetric(STATS_METRIC_EL_CYCLE),
                 "instantaneous_eventloop_duration_usec:%llu\r\n", getInstantaneousMetric(STATS_METRIC_EL_DURATION)));
+        
+        /* Accelerator stats */
+#ifdef ENABLE_ACCELERATOR
+        info = sdscatprintf(info,
+                            "accelerated_commands_total:%lld\r\n"
+                            "legacy_commands_total:%lld\r\n"
+                            "fallback_invocations:%lld\r\n",
+                            accelerated_commands_total,
+                            legacy_commands_total,
+                            fallback_invocations);
+#endif
+        
         info = genValkeyInfoStringACLStats(info);
     }
 
