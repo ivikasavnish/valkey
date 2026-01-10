@@ -29,6 +29,7 @@
  */
 
 #include "worker.h"
+#include "fastpath.h"
 #include <pthread.h>
 #include <stdlib.h>
 
@@ -41,6 +42,8 @@
 typedef struct completion_entry {
     client *c;
     sds response;
+    int response_type;      /* 0=bulk, 1=integer, 2=simple, 3=error */
+    long long int_value;    /* For integer responses */
     int status;
     struct completion_entry *next;
 } completion_entry;
@@ -131,11 +134,13 @@ static void completion_queue_shutdown(void) {
 }
 
 /* v3: Enqueue completion (called by worker threads) */
-static void enqueue_completion(client *c, sds response, int status) {
+static void enqueue_completion(client *c, command_result *result) {
     completion_entry *entry = zmalloc(sizeof(completion_entry));
     entry->c = c;
-    entry->response = response;
-    entry->status = status;
+    entry->response = result ? result->response : NULL;
+    entry->response_type = result ? result->response_type : 3; /* error if no result */
+    entry->int_value = result ? result->int_value : 0;
+    entry->status = result ? result->success : 0;
     entry->next = NULL;
     
     pthread_mutex_lock(&completion_queue.lock);
@@ -177,17 +182,42 @@ void worker_process_completions(void) {
         completion_entry *entry = dequeue_completion();
         if (!entry) break;
         
-        /* Send response to client */
-        if (entry->response) {
-            addReplyBulkCBuffer(entry->c, entry->response, sdslen(entry->response));
-            sdsfree(entry->response);
-        } else if (entry->status == 0) {
-            addReply(entry->c, shared.ok);
-        } else {
-            addReply(entry->c, shared.err);
+        /* Send response to client based on type */
+        switch (entry->response_type) {
+            case 0: /* bulk string */
+                if (entry->response) {
+                    addReplyBulkCBuffer(entry->c, entry->response, sdslen(entry->response));
+                } else {
+                    addReplyNull(entry->c);
+                }
+                break;
+            
+            case 1: /* integer */
+                addReplyLongLong(entry->c, entry->int_value);
+                break;
+            
+            case 2: /* simple string */
+                if (entry->response) {
+                    addReplyBulkCBuffer(entry->c, entry->response, sdslen(entry->response));
+                } else {
+                    addReply(entry->c, shared.ok);
+                }
+                break;
+            
+            case 3: /* error */
+                if (entry->response) {
+                    addReplyErrorFormat(entry->c, "%s", entry->response);
+                } else {
+                    addReply(entry->c, shared.err);
+                }
+                break;
+            
+            default:
+                addReply(entry->c, shared.err);
         }
         
         /* Cleanup */
+        if (entry->response) sdsfree(entry->response);
         zfree(entry);
     }
 }
@@ -335,11 +365,8 @@ int key_is_locked(sds key) {
     return locked;
 }
 
-/* v3: Execute command in worker thread and prepare response */
-static sds execute_and_prepare_response(client *c) {
-    /* For v3, we need to execute command logic and capture response */
-    /* This is a simplified version - production needs more robust implementation */
-    
+/* v3: Execute command in worker thread using fast path */
+static command_result *execute_fastpath(client *c) {
     sds key = NULL;
     if (c->argc > 1) {
         key = objectGetVal(c->argv[1]);
@@ -351,18 +378,15 @@ static sds execute_and_prepare_response(client *c) {
         key_lock_acquire(key, write_op);
     }
     
-    /* Execute command - Note: This still calls call() which isn't ideal
-     * but it's a starting point. Production v3 needs custom implementations */
-    call(c, CMD_CALL_FULL);
+    /* Execute command using fast path */
+    command_result *result = fastpath_execute(c);
     
     /* Release key lock */
     if (key) {
         key_lock_release(key);
     }
     
-    /* For now, return NULL (response already sent by call())
-     * Future: capture response and return it */
-    return NULL;
+    return result;
 }
 
 /* Worker thread main loop - v3 with completion queue */
@@ -388,12 +412,18 @@ static void *worker_thread_main(void *arg) {
         
         pthread_mutex_unlock(&pool->lock);
         
-        /* v3: Execute and prepare response */
+        /* v3: Execute using fast path */
         if (entry.c && entry.c->cmd && entry.c->cmd->proc) {
-            sds response = execute_and_prepare_response(entry.c);
+            command_result *result = execute_fastpath(entry.c);
             
             /* Enqueue completion */
-            enqueue_completion(entry.c, response, 0);
+            enqueue_completion(entry.c, result);
+            
+            /* Free result (completion queue has copied data) */
+            if (result) {
+                /* Don't free response as it's transferred to completion queue */
+                zfree(result);
+            }
         }
     }
     
