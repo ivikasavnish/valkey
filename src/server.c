@@ -6248,6 +6248,18 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "eventloop_duration_cmd_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_CMD].sum,
                 "instantaneous_eventloop_cycles_per_sec:%llu\r\n", getInstantaneousMetric(STATS_METRIC_EL_CYCLE),
                 "instantaneous_eventloop_duration_usec:%llu\r\n", getInstantaneousMetric(STATS_METRIC_EL_DURATION)));
+        
+        /* Accelerator stats */
+#ifdef ENABLE_ACCELERATOR
+        info = sdscatprintf(info,
+                            "accelerated_commands_total:%lld\r\n"
+                            "legacy_commands_total:%lld\r\n"
+                            "fallback_invocations:%lld\r\n",
+                            accelerated_commands_total,
+                            legacy_commands_total,
+                            fallback_invocations);
+#endif
+        
         info = genValkeyInfoStringACLStats(info);
     }
 

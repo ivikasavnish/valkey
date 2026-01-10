@@ -64,7 +64,13 @@ int is_accelerated_command(const struct serverCommand *cmd) {
     return 0;
 }
 
-/* Route command through accelerated execution path */
+/* Route command through accelerated execution path
+ * 
+ * For v1, we execute commands synchronously in the main thread,
+ * just like the legacy path. The difference is that we're routing
+ * through this entrypoint which can be extended in the future
+ * to use worker threads or other optimizations.
+ */
 void command_entrypoint(client *c) {
     /* Safety checks - if anything looks wrong, fallback immediately */
     if (!c || !c->cmd || !c->cmd->proc) {
@@ -75,27 +81,21 @@ void command_entrypoint(client *c) {
         return;
     }
     
-    /* Enqueue command to worker thread */
-    int result = worker_enqueue_command(c);
-    
-    if (result != 0) {
-        /* Failed to enqueue - fallback to legacy path */
-        fallback_invocations++;
-        call(c, CMD_CALL_FULL);
-    } else {
-        accelerated_commands_total++;
-    }
+    /* For now, execute directly in main thread (same as legacy path)
+     * This maintains correctness while allowing future optimization */
+    accelerated_commands_total++;
+    call(c, CMD_CALL_FULL);
 }
 
 /* Initialize the accelerator system */
 void accelerator_init(void) {
-    worker_init();
-    serverLog(LL_NOTICE, "Accelerator enabled");
+    /* For v1, we don't actually start worker threads yet
+     * This is a placeholder for future enhancements */
+    serverLog(LL_NOTICE, "Accelerator enabled (routing mode)");
 }
 
 /* Shutdown the accelerator system */
 void accelerator_shutdown(void) {
-    worker_shutdown();
     serverLog(LL_NOTICE, "Accelerator shutdown complete");
 }
 
