@@ -37,11 +37,28 @@
 #define WORKER_QUEUE_SIZE 10000
 #define KEY_LOCK_TABLE_SIZE 1024
 
+/* v3: Completion queue entry for async results */
+typedef struct completion_entry {
+    client *c;
+    sds response;
+    int status;
+    struct completion_entry *next;
+} completion_entry;
+
+/* v3: Completion queue (MPSC) */
+static struct {
+    completion_entry *head;
+    completion_entry *tail;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    int count;
+} completion_queue;
+
 /* Key lock entry for concurrency control */
 typedef struct key_lock_entry {
     sds key;
-    int write_lock;       /* 1 if write lock, 0 if read lock */
-    int ref_count;        /* Number of readers (for read locks) */
+    int write_lock;
+    int ref_count;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
     struct key_lock_entry *next;
@@ -85,6 +102,96 @@ static unsigned int key_hash(sds key) {
     return hash % KEY_LOCK_TABLE_SIZE;
 }
 
+/* v3: Initialize completion queue */
+static void completion_queue_init(void) {
+    completion_queue.head = NULL;
+    completion_queue.tail = NULL;
+    completion_queue.count = 0;
+    pthread_mutex_init(&completion_queue.lock, NULL);
+    pthread_cond_init(&completion_queue.cond, NULL);
+    serverLog(LL_NOTICE, "Completion queue initialized");
+}
+
+/* v3: Shutdown completion queue */
+static void completion_queue_shutdown(void) {
+    pthread_mutex_lock(&completion_queue.lock);
+    
+    /* Free all pending completions */
+    completion_entry *entry = completion_queue.head;
+    while (entry) {
+        completion_entry *next = entry->next;
+        if (entry->response) sdsfree(entry->response);
+        zfree(entry);
+        entry = next;
+    }
+    
+    pthread_mutex_unlock(&completion_queue.lock);
+    pthread_mutex_destroy(&completion_queue.lock);
+    pthread_cond_destroy(&completion_queue.cond);
+}
+
+/* v3: Enqueue completion (called by worker threads) */
+static void enqueue_completion(client *c, sds response, int status) {
+    completion_entry *entry = zmalloc(sizeof(completion_entry));
+    entry->c = c;
+    entry->response = response;
+    entry->status = status;
+    entry->next = NULL;
+    
+    pthread_mutex_lock(&completion_queue.lock);
+    
+    if (completion_queue.tail) {
+        completion_queue.tail->next = entry;
+    } else {
+        completion_queue.head = entry;
+    }
+    completion_queue.tail = entry;
+    completion_queue.count++;
+    
+    pthread_cond_signal(&completion_queue.cond);
+    pthread_mutex_unlock(&completion_queue.lock);
+}
+
+/* v3: Dequeue completion (called by main thread) */
+static completion_entry *dequeue_completion(void) {
+    pthread_mutex_lock(&completion_queue.lock);
+    
+    completion_entry *entry = completion_queue.head;
+    if (entry) {
+        completion_queue.head = entry->next;
+        if (!completion_queue.head) {
+            completion_queue.tail = NULL;
+        }
+        completion_queue.count--;
+    }
+    
+    pthread_mutex_unlock(&completion_queue.lock);
+    return entry;
+}
+
+/* v3: Process completions (called from main thread event loop) */
+void worker_process_completions(void) {
+    int batch_size = 100;  /* Process up to 100 completions per call */
+    
+    for (int i = 0; i < batch_size; i++) {
+        completion_entry *entry = dequeue_completion();
+        if (!entry) break;
+        
+        /* Send response to client */
+        if (entry->response) {
+            addReplyBulkCBuffer(entry->c, entry->response, sdslen(entry->response));
+            sdsfree(entry->response);
+        } else if (entry->status == 0) {
+            addReply(entry->c, shared.ok);
+        } else {
+            addReply(entry->c, shared.err);
+        }
+        
+        /* Cleanup */
+        zfree(entry);
+    }
+}
+
 /* Initialize key lock system */
 static void key_lock_init(void) {
     key_locks.table = zmalloc(sizeof(key_lock_entry*) * KEY_LOCK_TABLE_SIZE);
@@ -114,7 +221,7 @@ static void key_lock_shutdown(void) {
     pthread_mutex_destroy(&key_locks.global_lock);
 }
 
-/* Acquire key lock - write_lock=1 for writes, 0 for guaranteed reads */
+/* Acquire key lock */
 int key_lock_acquire(sds key, int write_lock) {
     if (!key) return -1;
     
@@ -132,7 +239,6 @@ int key_lock_acquire(sds key, int write_lock) {
     }
     
     if (!entry) {
-        /* Create new lock entry */
         entry = zmalloc(sizeof(key_lock_entry));
         entry->key = sdsdup(key);
         entry->write_lock = write_lock;
@@ -156,14 +262,12 @@ int key_lock_acquire(sds key, int write_lock) {
     pthread_mutex_lock(&entry->mutex);
     
     if (write_lock) {
-        /* Write lock - wait until no readers or writers */
         while (entry->ref_count > 0) {
             pthread_cond_wait(&entry->cond, &entry->mutex);
         }
         entry->write_lock = 1;
         entry->ref_count = 1;
     } else {
-        /* Read lock - wait if there's a write lock */
         while (entry->write_lock) {
             pthread_cond_wait(&entry->cond, &entry->mutex);
         }
@@ -203,7 +307,6 @@ void key_lock_release(sds key) {
         entry->ref_count--;
     }
     
-    /* Wake up waiting threads */
     pthread_cond_broadcast(&entry->cond);
     pthread_mutex_unlock(&entry->mutex);
 }
@@ -232,14 +335,43 @@ int key_is_locked(sds key) {
     return locked;
 }
 
-/* Worker thread main loop */
+/* v3: Execute command in worker thread and prepare response */
+static sds execute_and_prepare_response(client *c) {
+    /* For v3, we need to execute command logic and capture response */
+    /* This is a simplified version - production needs more robust implementation */
+    
+    sds key = NULL;
+    if (c->argc > 1) {
+        key = objectGetVal(c->argv[1]);
+    }
+    
+    /* Acquire key lock */
+    int write_op = (c->cmd->flags & CMD_WRITE) ? 1 : 0;
+    if (key) {
+        key_lock_acquire(key, write_op);
+    }
+    
+    /* Execute command - Note: This still calls call() which isn't ideal
+     * but it's a starting point. Production v3 needs custom implementations */
+    call(c, CMD_CALL_FULL);
+    
+    /* Release key lock */
+    if (key) {
+        key_lock_release(key);
+    }
+    
+    /* For now, return NULL (response already sent by call())
+     * Future: capture response and return it */
+    return NULL;
+}
+
+/* Worker thread main loop - v3 with completion queue */
 static void *worker_thread_main(void *arg) {
     worker_pool *pool = (worker_pool *)arg;
     
     while (1) {
         pthread_mutex_lock(&pool->lock);
         
-        /* Wait for commands or shutdown signal */
         while (pool->queue_count == 0 && !pool->shutdown) {
             pthread_cond_wait(&pool->cond, &pool->lock);
         }
@@ -256,33 +388,12 @@ static void *worker_thread_main(void *arg) {
         
         pthread_mutex_unlock(&pool->lock);
         
-        /* Execute command with key locking */
+        /* v3: Execute and prepare response */
         if (entry.c && entry.c->cmd && entry.c->cmd->proc) {
-            /* Acquire key lock before execution */
-            sds key = NULL;
-            int write_op = 0;
+            sds response = execute_and_prepare_response(entry.c);
             
-            /* Determine if this is a write operation */
-            if (entry.c->cmd->flags & CMD_WRITE) {
-                write_op = 1;
-            }
-            
-            /* Get the key from arguments */
-            if (entry.c->argc > 1) {
-                key = objectGetVal(entry.c->argv[1]);
-            }
-            
-            if (key) {
-                key_lock_acquire(key, write_op);
-            }
-            
-            /* Execute command */
-            call(entry.c, CMD_CALL_FULL);
-            
-            /* Release key lock after execution */
-            if (key) {
-                key_lock_release(key);
-            }
+            /* Enqueue completion */
+            enqueue_completion(entry.c, response, 0);
         }
     }
     
@@ -329,11 +440,14 @@ void worker_init(void) {
     /* Initialize key lock system */
     key_lock_init();
     
+    /* v3: Initialize completion queue */
+    completion_queue_init();
+    
     /* Initialize worker pools */
     worker_pool_init(&worker_pools[WORKER_POOL_STRING], "string");
     worker_pool_init(&worker_pools[WORKER_POOL_HASH], "hash");
     
-    serverLog(LL_NOTICE, "All worker pools initialized");
+    serverLog(LL_NOTICE, "All worker pools initialized (v3 async mode)");
 }
 
 /* Shutdown worker threads */
@@ -342,6 +456,9 @@ void worker_shutdown(void) {
     for (int i = 0; i < WORKER_POOL_MAX; i++) {
         worker_pool_shutdown(&worker_pools[i]);
     }
+    
+    /* v3: Shutdown completion queue */
+    completion_queue_shutdown();
     
     /* Shutdown key lock system */
     key_lock_shutdown();
@@ -359,18 +476,15 @@ int worker_enqueue_command(client *c, worker_pool_type pool_type) {
     
     pthread_mutex_lock(&pool->lock);
     
-    /* Check if queue is full */
     if (pool->queue_count >= pool->queue_size) {
         pthread_mutex_unlock(&pool->lock);
-        return -1; /* Queue full, caller should fallback */
+        return -1;
     }
     
-    /* Enqueue command */
     pool->queue[pool->queue_tail].c = c;
     pool->queue_tail = (pool->queue_tail + 1) % pool->queue_size;
     pool->queue_count++;
     
-    /* Signal worker thread */
     pthread_cond_signal(&pool->cond);
     
     pthread_mutex_unlock(&pool->lock);
@@ -380,20 +494,19 @@ int worker_enqueue_command(client *c, worker_pool_type pool_type) {
 
 #else /* !ENABLE_ACCELERATOR */
 
-/* Accelerator disabled - all functions are no-ops */
-
 void worker_init(void) {
-    /* No-op */
 }
 
 void worker_shutdown(void) {
-    /* No-op */
 }
 
 int worker_enqueue_command(client *c, worker_pool_type pool) {
     UNUSED(c);
     UNUSED(pool);
-    return -1; /* Always fail */
+    return -1;
+}
+
+void worker_process_completions(void) {
 }
 
 int key_lock_acquire(sds key, int write_lock) {

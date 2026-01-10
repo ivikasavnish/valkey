@@ -54,6 +54,7 @@
 
 #include "eval.h"
 #include "router/entrypoint.h"
+#include "executor/worker.h"
 
 #include "trace/trace_commands.h"
 
@@ -1917,6 +1918,11 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     }
 
     processIOThreadsWriteDone();
+
+    /* v3: Process accelerator completion queue */
+#ifdef ENABLE_ACCELERATOR
+    worker_process_completions();
+#endif
 
     /* Record cron time in beforeSleep. This does not include the time consumed by AOF writing and IO writing above. */
     monotime cron_start_time_after_write = getMonotonicUs();
