@@ -33,13 +33,29 @@
 
 #include "../server.h"
 
-/* Initialize worker thread */
+/* Worker pool types for different command categories */
+typedef enum {
+    WORKER_POOL_STRING,  /* String commands: GET, SET, INCR */
+    WORKER_POOL_HASH,    /* Hash commands: HGET, HSET */
+    WORKER_POOL_MAX
+} worker_pool_type;
+
+/* Initialize worker threads */
 void worker_init(void);
 
-/* Shutdown worker thread */
+/* Shutdown worker threads */
 void worker_shutdown(void);
 
 /* Enqueue a command for execution */
-int worker_enqueue_command(client *c);
+int worker_enqueue_command(client *c, worker_pool_type pool);
+
+/* Acquire key lock for write operations */
+int key_lock_acquire(sds key, int write_lock);
+
+/* Release key lock */
+void key_lock_release(sds key);
+
+/* Check if key is locked */
+int key_is_locked(sds key);
 
 #endif /* __WORKER_H */

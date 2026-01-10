@@ -39,24 +39,31 @@ long long fallback_invocations = 0;
 
 #ifdef ENABLE_ACCELERATOR
 
-/* Whitelist of accelerated commands */
-static const char *accelerated_command_names[] = {
-    "get",
-    "set",
-    "incr",
-    "hget",
-    "hset",
-    NULL
+/* Command configuration: name and worker pool */
+typedef struct {
+    const char *name;
+    worker_pool_type pool;
+} command_config;
+
+/* Whitelist of accelerated commands with their worker pools */
+static const command_config accelerated_commands[] = {
+    {"get", WORKER_POOL_STRING},
+    {"set", WORKER_POOL_STRING},
+    {"incr", WORKER_POOL_STRING},
+    {"hget", WORKER_POOL_HASH},
+    {"hset", WORKER_POOL_HASH},
+    {NULL, 0}
 };
 
-/* Check if a command is in the acceleration whitelist */
-int is_accelerated_command(const struct serverCommand *cmd) {
+/* Check if a command is in the acceleration whitelist and return its pool */
+static int get_accelerated_command_pool(const struct serverCommand *cmd, worker_pool_type *pool) {
     if (!cmd || !cmd->declared_name) {
         return 0;
     }
     
-    for (int i = 0; accelerated_command_names[i] != NULL; i++) {
-        if (strcasecmp(cmd->declared_name, accelerated_command_names[i]) == 0) {
+    for (int i = 0; accelerated_commands[i].name != NULL; i++) {
+        if (strcasecmp(cmd->declared_name, accelerated_commands[i].name) == 0) {
+            *pool = accelerated_commands[i].pool;
             return 1;
         }
     }
@@ -64,12 +71,16 @@ int is_accelerated_command(const struct serverCommand *cmd) {
     return 0;
 }
 
+/* Check if a command is in the acceleration whitelist */
+int is_accelerated_command(const struct serverCommand *cmd) {
+    worker_pool_type pool;
+    return get_accelerated_command_pool(cmd, &pool);
+}
+
 /* Route command through accelerated execution path
  * 
- * For v1, we execute commands synchronously in the main thread,
- * just like the legacy path. The difference is that we're routing
- * through this entrypoint which can be extended in the future
- * to use worker threads or other optimizations.
+ * v2: Implements async worker thread execution with key-level locking
+ * and work partitioning by command type (string vs hash).
  */
 void command_entrypoint(client *c) {
     /* Safety checks - if anything looks wrong, fallback immediately */
@@ -81,21 +92,37 @@ void command_entrypoint(client *c) {
         return;
     }
     
-    /* For now, execute directly in main thread (same as legacy path)
-     * This maintains correctness while allowing future optimization */
-    accelerated_commands_total++;
-    call(c, CMD_CALL_FULL);
+    /* Determine which worker pool to use */
+    worker_pool_type pool;
+    if (!get_accelerated_command_pool(c->cmd, &pool)) {
+        /* Not in whitelist - fallback */
+        fallback_invocations++;
+        call(c, CMD_CALL_FULL);
+        return;
+    }
+    
+    /* Enqueue command to appropriate worker pool */
+    int result = worker_enqueue_command(c, pool);
+    
+    if (result != 0) {
+        /* Failed to enqueue - fallback to legacy path */
+        fallback_invocations++;
+        call(c, CMD_CALL_FULL);
+    } else {
+        accelerated_commands_total++;
+    }
 }
 
 /* Initialize the accelerator system */
 void accelerator_init(void) {
-    /* For v1, we don't actually start worker threads yet
-     * This is a placeholder for future enhancements */
-    serverLog(LL_NOTICE, "Accelerator enabled (routing mode)");
+    /* Initialize worker threads with key locking */
+    worker_init();
+    serverLog(LL_NOTICE, "Accelerator v2 enabled (async workers + key locking)");
 }
 
 /* Shutdown the accelerator system */
 void accelerator_shutdown(void) {
+    worker_shutdown();
     serverLog(LL_NOTICE, "Accelerator shutdown complete");
 }
 
