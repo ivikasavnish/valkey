@@ -362,9 +362,9 @@ tags {"benchmark network external:skip logreqres:skip"} {
 
         test {benchmark: reconnect option} {
             set cmd [valkeybenchmark $master_host $master_port "-c 5 -n 10 -t set,get -k 0"]
+            # Reconnect mode outputs a warning to stderr, so we need custom error handling
             r config resetstat
             r flushall
-            # Reconnect mode may output a warning, so we handle it specially
             if {[catch { exec {*}$cmd 2>@1 } output]} {
                 # Check if it's just the keepalive warning, not a real error
                 if {![string match "*WARNING: Keepalive disabled*" $output] && ![string match "*requests completed*" $output]} {
