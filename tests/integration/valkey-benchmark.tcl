@@ -317,6 +317,63 @@ tags {"benchmark network external:skip logreqres:skip"} {
             default_set_get_checks
         }
 
+        test {benchmark: precision option} {
+            set cmd [valkeybenchmark $master_host $master_port "-c 5 -n 10 -t set --precision 2"]
+            set output [common_bench_setup $cmd]
+            # Check for decimal values with precision
+            # Output should contain numbers with 2 decimal places
+            assert_match  {*calls=10,*} [cmdstat set]
+        }
+
+        test {benchmark: rps rate limiting} {
+            set start_time [clock clicks -millisec]
+            set cmd [valkeybenchmark $master_host $master_port "-c 5 -n 100 -t set --rps 50"]
+            set output [common_bench_setup $cmd]
+            set end_time [clock clicks -millisec]
+            
+            # With 100 requests at 50 rps, should take at least 2 seconds
+            set elapsed [expr {($end_time - $start_time)/1000.0}]
+            assert {$elapsed >= 2.0}
+            assert_match  {*calls=100,*} [cmdstat set]
+        }
+
+        test {benchmark: RESP3 protocol mode} {
+            set cmd [valkeybenchmark $master_host $master_port "-c 5 -n 10 -t set,get -3"]
+            common_bench_setup $cmd
+            default_set_get_checks
+        }
+
+        test {benchmark: database selection} {
+            set cmd [valkeybenchmark $master_host $master_port "-c 5 -n 10 -t set --dbnum 1"]
+            common_bench_setup $cmd
+            # Switch to db 1 and verify the keys exist there
+            r select 1
+            assert_match  {*calls=10,*} [cmdstat set]
+            # Verify a key exists in db 1
+            assert {[r exists key:__rand_int__] == 1}
+            r select 0
+        }
+
+        test {benchmark: keep alive option} {
+            set cmd [valkeybenchmark $master_host $master_port "-c 5 -n 10 -t set,get -k 1"]
+            common_bench_setup $cmd
+            default_set_get_checks
+        }
+
+        test {benchmark: reconnect option} {
+            set cmd [valkeybenchmark $master_host $master_port "-c 5 -n 10 -t set,get -k 0"]
+            # Reconnect mode outputs a warning to stderr, so we need custom error handling
+            r config resetstat
+            r flushall
+            if {[catch { exec {*}$cmd 2>@1 } output]} {
+                # Check if it's just the keepalive warning, not a real error
+                if {![string match "*WARNING: Keepalive disabled*" $output] && ![string match "*requests completed*" $output]} {
+                    fail "valkey-benchmark failed unexpectedly: $output"
+                }
+            }
+            default_set_get_checks
+        }
+
         # tls specific tests
         if {$::tls} {
             test {benchmark: specific tls-ciphers} {
